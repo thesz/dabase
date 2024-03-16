@@ -1,3 +1,4 @@
+-- Copyright (C) 2024 Serguey Zefirov
 module P
 	( module Control.Applicative
 	, module P

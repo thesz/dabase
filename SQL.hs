@@ -1,3 +1,4 @@
+-- Copyright (C) 2024 Serguey Zefirov
 module SQL
 	( module SQL
 	) where

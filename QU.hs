@@ -1,3 +1,4 @@
+-- Copyright (C) 2024 Serguey Zefirov
 {-# LANGUAGE BangPatterns #-}
 
 module QU
@@ -20,6 +21,10 @@ import DB
 
 numDiffValues :: Int
 numDiffValues = 3000000 -- enough for query at hand, should be determined dynamically.
+
+numClasses :: Int
+numClasses = 64
+
 
 data Relation =
 		USE { useTable	:: String, useCheck :: [Expr] }
@@ -84,24 +89,34 @@ scanAnalyze db rels = do
 	print tables
 	let	huh _ _ = error $ "duplicate key?"
 	(sets, counts) <- (\sc -> (Map.unionsWith huh $ map  fst sc, map snd sc)) <$>
-			forM tables (\ t -> scan Map.empty t)
+			forM tables (\(ti, t) -> scan Map.empty ti t)
 	forM_ (Map.toList sets) $ \(f, s) -> do
-		putStrLn $ "  field " ++ show f ++ ": " ++ show (IntSet.size s)
+		putStrLn $ "  field " ++ show f ++ ": " ++ show (IntSet.size $ Map.foldr IntSet.union IntSet.empty s) ++ ", " ++ show (Map.map IntSet.size s)
 	let	combine sets [] = sets
 		combine sets (Rel _ a b : rs) = combine sets' rs
 			where
-				s x = Map.findWithDefault IntSet.empty x sets
-				combined = IntSet.intersection (s a) (s b)
-				sets' = Map.insert a combined $ Map.insert b combined sets
-		combined = combine sets relEqs
+				s x = Map.findWithDefault Map.empty x sets
+				sa = s a
+				sb = s b
+				ua = Map.foldr IntSet.union IntSet.empty sa
+				ub = Map.foldr IntSet.union IntSet.empty sb
+				ca = Map.map (IntSet.intersection ub) sa
+				cb = Map.map (IntSet.intersection ua) sb
+				sets' = Map.insert a ca $ Map.insert b cb sets
+		recombine sets rs
+			| sets' == sets = sets
+			| otherwise = recombine sets' rs
+			where
+				sets' = combine sets rs
+		combined = recombine sets relEqs
 	putStrLn $ "table rows' counts:"
-	forM_ (zip tables counts) $ \(t, (rc, rp)) -> do
+	forM_ (zip tables counts) $ \((_, t), (rc, rp)) -> do
 		putStrLn $ "    table " ++ show t ++ ": " ++ show rc ++ " rows read, " ++ show rp ++ " rows pass filters."
 	putStrLn $ "after combination:"
 	forM_ (Map.toList combined) $ \(f, s) -> do
-		putStrLn $ "  field " ++ show f ++ ": " ++ show (IntSet.size s)
+		putStrLn $ "  field " ++ show f ++ ": " ++ show (IntSet.size $ Map.foldr IntSet.union IntSet.empty s) ++ ", " ++ show (Map.map IntSet.size s)
 	(sets, counts) <- (\sc -> (Map.unionsWith huh $ map  fst sc, map snd sc)) <$>
-			forM tables (\ t -> scan combined t)
+			forM tables (\(ti, t) -> scan combined ti t)
 	putStrLn $ "table rows' counts with sets filtering:"
 	forM_ (zip tables counts) $ \(t, (rc, rp)) -> do
 		putStrLn $ "    table " ++ show t ++ ": " ++ show rc ++ " rows read, " ++ show rp ++ " rows pass filters."
@@ -110,7 +125,7 @@ scanAnalyze db rels = do
 		relEqs = toRelEqs rels
 		toRelEqs (USE _ _) = []
 		toRelEqs (SETREL _ re _ rs) = re ++ toRelEqs rs
-		tables = List.nub $ toTables rels
+		tables = zip [0..] $ List.nub $ toTables rels
 		toTables (USE t _) = [t]
 		toTables (SETREL t _ _ rs) = t : toTables rs
 		relFields = List.nub $ toRelFields rels
@@ -124,12 +139,12 @@ scanAnalyze db rels = do
 			| t == t' = chks
 			| otherwise = tableChecks t rs
 		fn table = dbSetDir db ++ "/" ++ table ++ ".dat"
-		scan sets table = do
+		scan sets tablei table = do
 			putStrLn $ "scanning " ++ show table
 			let	relfs = filter ((==table) . fiTable) relFields
 				checks = tableChecks table rels
 			h <- openBinaryFile (fn table) ReadMode
-			scanLoop sets 0 0 (Map.fromList [(rf, IntSet.empty) | rf <- relfs]) h relfs checks
+			scanLoop tablei sets 0 0 (Map.fromList [(rf, Map.empty) | rf <- relfs]) h relfs checks
 		eval fields e@(Field (FieldInfo _ _ i ty)) = do
 			let	bs = fields V.! i
 				s = map (toEnum . fromIntegral) $ BS.unpack bs :: String
@@ -158,7 +173,9 @@ scanAnalyze db rels = do
 				else return False
 		hash (ConstInt i) = mod i numDiffValues
 		hash Null = numDiffValues - 1
-		scanLoop sets !rc !rp !digests h relFields checks = do
+		scanLoop tablei sets !rc !rp !digests h relFields checks = do
+			let	cls' = ((tablei * 0x8088405 + 1) * 0x8088405 + rc) * 0x8088405
+				cls = mod cls' numClasses
 			eof <- hIsEOF h
 			if eof
 				then return (digests, (rc, rp))
@@ -176,6 +193,9 @@ scanAnalyze db rels = do
 										return $ IntSet.member x $
 											Map.findWithDefault
 												IntSet.empty
+												cls $
+											Map.findWithDefault
+												Map.empty
 												f
 												sets
 								foldM chk b relFields
@@ -184,8 +204,8 @@ scanAnalyze db rels = do
 						then do
 							let	add ds fi = do
 									x <- hash <$> eval fs (Field fi)
-									return $ Map.insertWith IntSet.union fi (IntSet.singleton x) ds
+									return $ Map.insertWith (Map.unionWith IntSet.union) fi (Map.singleton cls $ IntSet.singleton x) ds
 							foldM add digests relFields
 						else return digests
-					scanLoop sets (rc + 1) (rp + fromEnum b) digests h relFields checks
+					scanLoop tablei sets (rc + 1) (rp + fromEnum b) digests h relFields checks
 
